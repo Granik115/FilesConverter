@@ -1,6 +1,7 @@
 import ctypes
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -12,7 +13,7 @@ if sys.platform.startswith("linux"):
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QThread, QTimer
 from PySide6.QtWidgets import QApplication
 
 from filesconverter.ui import MainWindow, OperationWorker, filename_for_format
@@ -33,19 +34,31 @@ def test_background_worker_finishes_and_releases_references() -> None:
     window = MainWindow()
     result = []
     errors = []
+    callback_on_gui_thread = []
     loop = QEventLoop()
     poll = QTimer()
     poll.setInterval(10)
     poll.timeout.connect(
-        lambda: loop.quit() if result and not window._threads and not window._workers else None
+        lambda: (
+            loop.quit()
+            if result
+            and not window._threads
+            and not window._workers
+            and not window._callbacks
+            else None
+        )
     )
     timeout = QTimer()
     timeout.setSingleShot(True)
     timeout.timeout.connect(loop.quit)
 
+    def completed(value: object) -> None:
+        result.append(value)
+        callback_on_gui_thread.append(QThread.currentThread() == window.thread())
+
     window._run_worker(
         OperationWorker(lambda: "готово"),
-        completed=result.append,
+        completed=completed,
         failed=errors.append,
     )
     poll.start()
@@ -54,8 +67,28 @@ def test_background_worker_finishes_and_releases_references() -> None:
 
     assert result == ["готово"]
     assert errors == []
+    assert callback_on_gui_thread == [True]
     assert window._threads == []
     assert window._workers == []
+    assert window._callbacks == []
+    window.close()
+    app.processEvents()
+
+
+def test_completion_dialog_opens_without_blocking() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window._set_busy(True, "Проверка…")
+
+    window._operation_done("Готово: test.fb2", Path.cwd())
+
+    assert not window._busy
+    assert len(window._message_boxes) == 1
+    box = window._message_boxes[0]
+    assert "Готово: test.fb2" in box.text()
+    box.accept()
+    app.processEvents()
+    assert window._message_boxes == []
     window.close()
     app.processEvents()
 
