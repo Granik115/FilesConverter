@@ -1,0 +1,84 @@
+name: Build and release Windows installer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content src/filesconverter/__init__.py -Raw
+          $version = [regex]::Match($text, '__version__\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $version) { throw "Version not found" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Generate icon
+        run: python scripts/generate_icon.py
+
+      - name: Test
+        run: |
+          python -m pytest -q
+          python -m ruff check src tests
+
+      - name: Build application
+        run: python -m PyInstaller --clean --noconfirm packaging/FilesConverter.spec
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force releases | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=${{ steps.version.outputs.version }}" `
+            "installer\FilesConverter.iss"
+
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $installer = "releases\FilesConverter-${{ steps.version.outputs.version }}-setup.exe"
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $installer -Leaf)" | `
+            Set-Content "releases\FilesConverter-${{ steps.version.outputs.version }}-SHA256.txt"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilesConverter-${{ steps.version.outputs.version }}-Windows
+          path: |
+            releases/FilesConverter-${{ steps.version.outputs.version }}-setup.exe
+            releases/FilesConverter-${{ steps.version.outputs.version }}-SHA256.txt
+
+      - name: Publish GitHub release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: FilesConverter ${{ steps.version.outputs.version }}
+          body_path: docs/release-notes-0.0.1.md
+          make_latest: true
+          files: |
+            releases/FilesConverter-${{ steps.version.outputs.version }}-setup.exe
+            releases/FilesConverter-${{ steps.version.outputs.version }}-SHA256.txt
