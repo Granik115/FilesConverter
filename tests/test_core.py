@@ -1,5 +1,6 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
@@ -129,3 +130,24 @@ def test_rejects_doctype(tmp_path: Path) -> None:
     )
     with pytest.raises(ConversionError, match="Небезопасная"):
         fb2_text(source)
+
+
+def test_merge_seven_book_sized_txt_files_is_fast(tmp_path: Path) -> None:
+    payload = ("Глава 1\n\nОбычный абзац текста.\n\n" * 15_000).strip()
+    sources = []
+    for index in range(7):
+        source = tmp_path / f"book-{index}.txt"
+        source.write_text(payload, encoding="utf-8")
+        sources.append(source)
+
+    started_at = perf_counter()
+    destination = merge_files(
+        sources,
+        tmp_path / "seven-books.txt",
+        output_format="txt",
+        add_source_titles=False,
+    )
+    elapsed = perf_counter() - started_at
+
+    assert destination.stat().st_size > 5_000_000
+    assert elapsed < 5

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -62,6 +63,22 @@ def human_size(size: int) -> str:
             return f"{value:.0f} {unit}" if unit == "Б" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} ГБ"
+
+
+def filename_for_format(filename: str, output_format: str) -> str:
+    """Keep the entered base name and enforce only a supported output extension."""
+
+    clean_name = Path(filename.strip() or "Объединённая-книга").name
+    path = Path(clean_name)
+    if path.suffix.lower() in {".txt", ".fb2"}:
+        clean_name = path.stem
+    return f"{clean_name}.{output_format.lower()}"
+
+
+def format_elapsed(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} мс"
+    return f"{seconds:.1f} с"
 
 
 class FileListWidget(QListWidget):
@@ -269,32 +286,44 @@ class MergePanel(QWidget):
         self.files = FilePicker(order_hint=True)
         layout.addWidget(self.files, 1)
 
-        options_group = QGroupBox("Параметры результата")
+        options_group = QGroupBox("Итоговый файл")
         form = QFormLayout(options_group)
         self.output_format = QComboBox()
         self.output_format.addItems(["FB2", "TXT"])
-        self.output_format.currentTextChanged.connect(self._format_changed)
-        form.addRow("Формат:", self.output_format)
+        form.addRow("Формат результата:", self.output_format)
 
-        output_row = QWidget()
-        output_layout = QHBoxLayout(output_row)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        self.output = QLineEdit(
-            str(settings.value("merge/output", Path.home() / "Documents" / "merged.fb2"))
+        saved_output = Path(
+            str(
+                settings.value(
+                    "merge/output",
+                    Path.home() / "Documents" / "Объединённая-книга.txt",
+                )
+            )
         )
+        directory_row = QWidget()
+        directory_layout = QHBoxLayout(directory_row)
+        directory_layout.setContentsMargins(0, 0, 0, 0)
+        self.output_directory = QLineEdit(str(saved_output.parent))
+        self.output_directory.setPlaceholderText("Папка для итогового файла")
         browse = QPushButton("Обзор…")
         browse.clicked.connect(self._choose_output)
-        output_layout.addWidget(self.output, 1)
-        output_layout.addWidget(browse)
-        form.addRow("Файл:", output_row)
+        directory_layout.addWidget(self.output_directory, 1)
+        directory_layout.addWidget(browse)
+        form.addRow("Сохранить в папку:", directory_row)
 
-        self.title = QLineEdit(str(settings.value("merge/title", "Объединённая книга")))
-        self.title.setPlaceholderText("Название объединённой книги")
-        form.addRow("Название:", self.title)
+        self.file_name = QLineEdit(saved_output.name)
+        self.file_name.setPlaceholderText("Например: Барьер-Ориона-все.txt")
+        form.addRow("Имя итогового файла:", self.file_name)
+
+        self.book_title_label = QLabel("Название книги:")
+        self.book_title = QLineEdit(str(settings.value("merge/title", "")))
+        self.book_title.setPlaceholderText("Если пусто — используется имя файла")
+        form.addRow(self.book_title_label, self.book_title)
+        self.author_label = QLabel("Автор:")
         self.author = QLineEdit(str(settings.value("merge/author", "")))
         self.author.setPlaceholderText("Необязательно")
-        form.addRow("Автор:", self.author)
-        self.source_titles = QCheckBox("Добавлять название каждого исходного файла")
+        form.addRow(self.author_label, self.author)
+        self.source_titles = QCheckBox("Добавлять заголовок перед каждым исходным файлом")
         self.source_titles.setChecked(
             str(settings.value("merge/source_titles", "true")).lower() != "false"
         )
@@ -302,9 +331,9 @@ class MergePanel(QWidget):
         layout.addWidget(options_group)
 
         actions = QHBoxLayout()
-        note = QLabel("FB2 объединяется через нормализованный текст.")
-        note.setObjectName("hint")
-        actions.addWidget(note)
+        self.format_note = QLabel()
+        self.format_note.setObjectName("hint")
+        actions.addWidget(self.format_note)
         actions.addStretch(1)
         self.start = QPushButton("Объединить")
         self.start.setObjectName("primaryButton")
@@ -312,42 +341,54 @@ class MergePanel(QWidget):
         actions.addWidget(self.start)
         layout.addLayout(actions)
 
+        self.output_format.currentTextChanged.connect(self._format_changed)
+        saved_format = str(settings.value("merge/format", "TXT")).upper()
+        self.output_format.setCurrentText(saved_format if saved_format in {"TXT", "FB2"} else "TXT")
+        self._format_changed(self.output_format.currentText())
+
     def _format_changed(self, value: str) -> None:
-        extension = f".{value.lower()}"
-        current = Path(self.output.text().strip() or "merged")
-        self.output.setText(str(current.with_suffix(extension)))
+        output_format = value.lower()
+        self.file_name.setText(filename_for_format(self.file_name.text(), output_format))
         is_fb2 = value == "FB2"
-        self.title.setEnabled(is_fb2)
-        self.author.setEnabled(is_fb2)
+        self.book_title_label.setVisible(is_fb2)
+        self.book_title.setVisible(is_fb2)
+        self.author_label.setVisible(is_fb2)
+        self.author.setVisible(is_fb2)
+        self.format_note.setText(
+            "FB2 будет создан заново из нормализованного текста."
+            if is_fb2
+            else "TXT-файлы объединяются напрямую; обычно это занимает меньше секунды."
+        )
 
     def _choose_output(self) -> None:
-        extension = self.output_format.currentText().lower()
-        selected_filter = (
-            "FictionBook 2 (*.fb2)" if extension == "fb2" else "Текстовый файл (*.txt)"
-        )
-        path, _ = QFileDialog.getSaveFileName(
+        folder = QFileDialog.getExistingDirectory(
             self,
-            "Имя объединённого файла",
-            self.output.text(),
-            selected_filter,
+            "Папка для итогового файла",
+            self.output_directory.text(),
         )
-        if path:
-            self.output.setText(str(Path(path).with_suffix(f".{extension}")))
+        if folder:
+            self.output_directory.setText(folder)
 
     def _request(self) -> None:
         paths = self.files.list.paths()
         if not paths:
             QMessageBox.information(self, "Нет файлов", "Добавьте хотя бы один TXT или FB2.")
             return
-        output = self.output.text().strip()
-        if not output:
-            QMessageBox.information(self, "Нет имени", "Выберите имя итогового файла.")
+        directory = self.output_directory.text().strip()
+        if not directory:
+            QMessageBox.information(self, "Нет папки", "Выберите папку для итогового файла.")
             return
         output_format = self.output_format.currentText().lower()
-        output = str(Path(output).with_suffix(f".{output_format}"))
-        metadata = BookMetadata(title=self.title.text(), author=self.author.text())
+        file_name = filename_for_format(self.file_name.text(), output_format)
+        self.file_name.setText(file_name)
+        output = str(Path(directory) / file_name)
+        metadata = BookMetadata(
+            title=self.book_title.text() if output_format == "fb2" else "",
+            author=self.author.text() if output_format == "fb2" else "",
+        )
         self.settings.setValue("merge/output", output)
-        self.settings.setValue("merge/title", self.title.text())
+        self.settings.setValue("merge/format", output_format.upper())
+        self.settings.setValue("merge/title", self.book_title.text())
         self.settings.setValue("merge/author", self.author.text())
         self.settings.setValue("merge/source_titles", self.source_titles.isChecked())
         self.requested.emit(
@@ -385,7 +426,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings()
         self._threads: list[QThread] = []
+        self._workers: list[QObject] = []
         self._busy = False
+        self._busy_started_at = 0.0
+        self._busy_message = ""
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(250)
+        self._elapsed_timer.timeout.connect(self._update_elapsed_status)
         self.setWindowTitle(f"FilesConverter {__version__}")
         self.setMinimumSize(920, 680)
         self.resize(1080, 760)
@@ -472,8 +519,24 @@ class MainWindow(QMainWindow):
         self.merge.start.setEnabled(not busy)
         self.progress.setVisible(busy)
         if busy:
+            self._busy_started_at = time.perf_counter()
+            self._busy_message = message or "Выполняется…"
             self.progress.setRange(0, 0)
+            self._elapsed_timer.start()
+        else:
+            self._elapsed_timer.stop()
         self.status_label.setText(message or ("Выполняется…" if busy else "Готово"))
+
+    def _elapsed_seconds(self) -> float:
+        if not self._busy_started_at:
+            return 0.0
+        return time.perf_counter() - self._busy_started_at
+
+    def _update_elapsed_status(self) -> None:
+        if self._busy:
+            self.status_label.setText(
+                f"{self._busy_message} · {format_elapsed(self._elapsed_seconds())}"
+            )
 
     def _run_worker(
         self,
@@ -490,12 +553,19 @@ class MainWindow(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
-            lambda current=thread: self._threads.remove(current)
-            if current in self._threads
-            else None
-        )
         self._threads.append(thread)
+        self._workers.append(worker)
+
+        def release_references(
+            current_thread: QThread = thread,
+            current_worker: QObject = worker,
+        ) -> None:
+            if current_thread in self._threads:
+                self._threads.remove(current_thread)
+            if current_worker in self._workers:
+                self._workers.remove(current_worker)
+
+        thread.finished.connect(release_references)
         thread.start()
 
     @Slot(list, str, bool)
@@ -544,6 +614,7 @@ class MainWindow(QMainWindow):
         )
 
     def _operation_done(self, message: str, folder: Path) -> None:
+        message = f"{message} · за {format_elapsed(self._elapsed_seconds())}"
         self._set_busy(False, message)
         box = QMessageBox(self)
         box.setWindowTitle("Готово")
@@ -556,7 +627,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _operation_failed(self, message: str) -> None:
-        self._set_busy(False, "Ошибка")
+        self._set_busy(False, f"Ошибка · через {format_elapsed(self._elapsed_seconds())}")
         QMessageBox.critical(self, "Ошибка", message)
 
     def check_updates(self, *, manual: bool) -> None:
