@@ -421,12 +421,44 @@ class OperationWorker(QObject):
             self.finished.emit()
 
 
+class WorkerCallbacks(QObject):
+    """Deliver worker results to callbacks owned by the GUI thread."""
+
+    handled = Signal()
+
+    def __init__(
+        self,
+        completed: Callable[[object], None],
+        failed: Callable[[str], None],
+        parent: QObject,
+    ) -> None:
+        super().__init__(parent)
+        self._completed = completed
+        self._failed = failed
+
+    @Slot(object)
+    def handle_completed(self, value: object) -> None:
+        try:
+            self._completed(value)
+        finally:
+            self.handled.emit()
+
+    @Slot(str)
+    def handle_failed(self, message: str) -> None:
+        try:
+            self._failed(message)
+        finally:
+            self.handled.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = QSettings()
         self._threads: list[QThread] = []
         self._workers: list[QObject] = []
+        self._callbacks: list[WorkerCallbacks] = []
+        self._message_boxes: list[QMessageBox] = []
         self._busy = False
         self._busy_started_at = 0.0
         self._busy_message = ""
@@ -546,26 +578,47 @@ class MainWindow(QMainWindow):
         failed: Callable[[str], None],
     ) -> None:
         thread = QThread(self)
+        callbacks = WorkerCallbacks(completed, failed, self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.completed.connect(completed)
-        worker.failed.connect(failed)
+        worker.completed.connect(
+            callbacks.handle_completed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.failed.connect(
+            callbacks.handle_failed,
+            Qt.ConnectionType.QueuedConnection,
+        )
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         self._threads.append(thread)
         self._workers.append(worker)
+        self._callbacks.append(callbacks)
 
-        def release_references(
-            current_thread: QThread = thread,
-            current_worker: QObject = worker,
-        ) -> None:
-            if current_thread in self._threads:
-                self._threads.remove(current_thread)
-            if current_worker in self._workers:
-                self._workers.remove(current_worker)
+        state = {"thread_finished": False, "callback_finished": False}
 
-        thread.finished.connect(release_references)
+        def release_if_finished() -> None:
+            if not all(state.values()):
+                return
+            if thread in self._threads:
+                self._threads.remove(thread)
+            if worker in self._workers:
+                self._workers.remove(worker)
+            if callbacks in self._callbacks:
+                self._callbacks.remove(callbacks)
+            callbacks.deleteLater()
+            thread.deleteLater()
+
+        def thread_finished() -> None:
+            state["thread_finished"] = True
+            release_if_finished()
+
+        def callback_finished() -> None:
+            state["callback_finished"] = True
+            release_if_finished()
+
+        thread.finished.connect(thread_finished)
+        callbacks.handled.connect(callback_finished)
         thread.start()
 
     @Slot(list, str, bool)
@@ -621,10 +674,20 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Information)
         box.setText(message)
         open_button = box.addButton("Открыть папку", QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QMessageBox.StandardButton.Ok)
-        box.exec()
-        if box.clickedButton() is open_button:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        ok_button = box.addButton(QMessageBox.StandardButton.Ok)
+        box.setDefaultButton(ok_button)
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        self._message_boxes.append(box)
+
+        def finished(_result: int) -> None:
+            if box.clickedButton() is open_button:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+            if box in self._message_boxes:
+                self._message_boxes.remove(box)
+            box.deleteLater()
+
+        box.finished.connect(finished)
+        box.open()
 
     def _operation_failed(self, message: str) -> None:
         self._set_busy(False, f"Ошибка · через {format_elapsed(self._elapsed_seconds())}")
